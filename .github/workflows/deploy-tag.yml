@@ -1,0 +1,142 @@
+name: Deploy Stable Image
+
+on:
+  workflow_call:
+    inputs:
+      ytdlp_version:
+        description: 'yt-dlp release tag to package, or "latest" to resolve the newest upstream release'
+        required: true
+        type: string
+      publish_latest:
+        description: "Also publish the image as latest"
+        required: true
+        type: boolean
+      publish_ghcr:
+        description: "Publish tags to GHCR"
+        required: true
+        type: boolean
+      publish_dockerhub:
+        description: "Publish tags to Docker Hub"
+        required: true
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      ytdlp_version:
+        description: 'yt-dlp release tag to package, or "latest" to resolve the newest upstream release'
+        required: true
+        default: "latest"
+      publish_latest:
+        description: "Also publish the image as latest"
+        required: true
+        default: false
+        type: boolean
+      publish_ghcr:
+        description: "Publish tags to GHCR"
+        required: true
+        default: true
+        type: boolean
+      publish_dockerhub:
+        description: "Publish tags to Docker Hub"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prepare:
+    name: Prepare Release Deploy
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      tags: ${{ steps.tags.outputs.tags }}
+
+    steps:
+      - name: Resolve publish settings
+        id: vars
+        uses: actions/github-script@v8
+        env:
+          INPUT_VERSION: ${{ inputs.ytdlp_version }}
+          INPUT_PUBLISH_LATEST: ${{ inputs.publish_latest }}
+          INPUT_PUBLISH_GHCR: ${{ inputs.publish_ghcr }}
+          INPUT_PUBLISH_DOCKERHUB: ${{ inputs.publish_dockerhub }}
+        with:
+          script: |
+            const inputVersion = process.env.INPUT_VERSION;
+            const publishLatest = process.env.INPUT_PUBLISH_LATEST === 'true';
+            const publishGhcr = process.env.INPUT_PUBLISH_GHCR === 'true';
+            const publishDockerHub = process.env.INPUT_PUBLISH_DOCKERHUB === 'true';
+            let version = inputVersion;
+
+            if (inputVersion === 'nightly') {
+              core.setFailed('Use deploy-nightly.yml to publish the nightly image');
+              return;
+            }
+
+            if (inputVersion === 'latest') {
+              const upstream = await github.rest.repos.getLatestRelease({
+                owner: 'yt-dlp',
+                repo: 'yt-dlp',
+              });
+              version = upstream.data.tag_name;
+            }
+
+            if (!version) {
+              core.setFailed('No yt-dlp version was resolved for this run');
+              return;
+            }
+
+            if (!publishGhcr && !publishDockerHub) {
+              core.setFailed('No target registries were selected for this deploy');
+              return;
+            }
+
+            core.setOutput('version', version);
+            core.setOutput('publish_latest', publishLatest ? 'true' : 'false');
+            core.setOutput('publish_ghcr', publishGhcr ? 'true' : 'false');
+            core.setOutput('publish_dockerhub', publishDockerHub ? 'true' : 'false');
+
+      - name: Prepare image tags
+        id: tags
+        shell: bash
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          PUBLISH_LATEST: ${{ steps.vars.outputs.publish_latest }}
+          PUBLISH_GHCR: ${{ steps.vars.outputs.publish_ghcr }}
+          PUBLISH_DOCKERHUB: ${{ steps.vars.outputs.publish_dockerhub }}
+        run: |
+          set -euo pipefail
+
+          ghcr_image="ghcr.io/friedrichrehren/yt-dlp"
+          dockerhub_image="friedrichrehren/yt-dlp"
+
+          {
+            echo "tags<<EOF"
+            if [[ "${PUBLISH_GHCR}" == "true" ]]; then
+              echo "${ghcr_image}:${VERSION}"
+            fi
+            if [[ "${PUBLISH_DOCKERHUB}" == "true" ]]; then
+              echo "${dockerhub_image}:${VERSION}"
+            fi
+            if [[ "${PUBLISH_LATEST}" == "true" ]]; then
+              if [[ "${PUBLISH_GHCR}" == "true" ]]; then
+                echo "${ghcr_image}:latest"
+              fi
+              if [[ "${PUBLISH_DOCKERHUB}" == "true" ]]; then
+                echo "${dockerhub_image}:latest"
+              fi
+            fi
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+  deploy:
+    name: Deploy Release Image
+    needs: prepare
+    uses: ./.github/workflows/deploy.yml
+    with:
+      stable: true
+      version: ${{ needs.prepare.outputs.version }}
+      tags: ${{ needs.prepare.outputs.tags }}
+    secrets: inherit

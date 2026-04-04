@@ -1,0 +1,185 @@
+name: Check Upstream Release
+
+on:
+  schedule:
+    - cron: "8 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  check-upstream:
+    name: Check Latest Upstream Release
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+      version: ${{ steps.check.outputs.version }}
+      publish_ghcr: ${{ steps.check.outputs.publish_ghcr }}
+      publish_dockerhub: ${{ steps.check.outputs.publish_dockerhub }}
+
+    steps:
+      - name: Check latest upstream release
+        id: check
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const ghcrPackageName = 'yt-dlp';
+            const ghcrPackageType = 'container';
+            const dockerHubNamespace = 'friedrichrehren';
+            const dockerHubRepository = 'yt-dlp';
+
+            const upstream = await github.rest.repos.getLatestRelease({
+              owner: 'yt-dlp',
+              repo: 'yt-dlp',
+            });
+
+            core.setOutput('should_deploy', 'false');
+            const latestUpstreamTag = upstream.data.tag_name;
+            let ghcrLatestTag = null;
+
+            try {
+              const ownerAccount = await github.rest.users.getByUsername({
+                username: owner,
+              });
+
+              const packageVersionsRoute =
+                ownerAccount.data.type === 'Organization'
+                  ? 'GET /orgs/{org}/packages/{package_type}/{package_name}/versions'
+                  : 'GET /users/{username}/packages/{package_type}/{package_name}/versions';
+              const packageVersionsParams =
+                ownerAccount.data.type === 'Organization'
+                  ? {
+                      org: owner,
+                      package_type: ghcrPackageType,
+                      package_name: ghcrPackageName,
+                    }
+                  : {
+                      username: owner,
+                      package_type: ghcrPackageType,
+                      package_name: ghcrPackageName,
+                    };
+
+              for (let page = 1; ; page += 1) {
+                const versions = await github.request(
+                  packageVersionsRoute,
+                  {
+                    ...packageVersionsParams,
+                    page,
+                    per_page: 100,
+                  },
+                );
+
+                if (versions.data.length === 0) {
+                  break;
+                }
+
+                const latestPackageVersion = versions.data.find((version) =>
+                  (version.metadata?.container?.tags ?? []).includes('latest'),
+                );
+
+                if (!latestPackageVersion) {
+                  continue;
+                }
+
+                // Automatic upstream-triggered publishes tag the same manifest
+                // with both the upstream release and "latest".
+                ghcrLatestTag =
+                  (latestPackageVersion.metadata?.container?.tags ?? []).find(
+                    (tag) => tag !== 'latest',
+                  ) ?? null;
+                break;
+              }
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+
+              console.log(
+                `No published ${ghcrPackageName} package exists yet on GHCR; treating this as the initial deploy`,
+              );
+            }
+
+            async function fetchDockerHubTag(tag) {
+              const response = await fetch(
+                `https://hub.docker.com/v2/namespaces/${dockerHubNamespace}/repositories/${dockerHubRepository}/tags/${encodeURIComponent(tag)}`,
+                {
+                  headers: {
+                    Accept: 'application/json',
+                  },
+                },
+              );
+
+              if (response.status === 404) {
+                return null;
+              }
+
+              if (!response.ok) {
+                throw new Error(
+                  `Docker Hub tag lookup failed for ${tag}: ${response.status} ${response.statusText}`,
+                );
+              }
+
+              return await response.json();
+            }
+
+            function getDockerHubDigests(tagData) {
+              return [...new Set(
+                (tagData?.images ?? [])
+                  .map((image) => image.digest)
+                  .filter(Boolean),
+              )].sort();
+            }
+
+            const dockerHubLatest = await fetchDockerHubTag('latest');
+            const dockerHubVersion = await fetchDockerHubTag(latestUpstreamTag);
+            const dockerHubLatestDigests = getDockerHubDigests(dockerHubLatest);
+            const dockerHubVersionDigests = getDockerHubDigests(dockerHubVersion);
+
+            const ghcrNeedsPublish = ghcrLatestTag !== latestUpstreamTag;
+            const dockerHubNeedsPublish =
+              dockerHubLatestDigests.length === 0
+              || dockerHubVersionDigests.length === 0
+              || JSON.stringify(dockerHubLatestDigests)
+                !== JSON.stringify(dockerHubVersionDigests);
+
+            if (!ghcrNeedsPublish && !dockerHubNeedsPublish) {
+              console.log(
+                `Latest upstream release ${latestUpstreamTag} is already deployed on GHCR and Docker Hub`,
+              );
+              return;
+            }
+
+            if (ghcrLatestTag === null) {
+              console.log(
+                `No deployed version is currently tagged latest on GHCR; dispatching initial deploy for ${latestUpstreamTag}`,
+              );
+            }
+
+            console.log(
+              `Registry repair plan for ${latestUpstreamTag}: GHCR=${ghcrNeedsPublish ? 'publish' : 'ok'}, Docker Hub=${dockerHubNeedsPublish ? 'publish' : 'ok'}`,
+            );
+            core.setOutput('should_deploy', 'true');
+            core.setOutput('version', latestUpstreamTag);
+            core.setOutput('publish_ghcr', ghcrNeedsPublish ? 'true' : 'false');
+            core.setOutput(
+              'publish_dockerhub',
+              dockerHubNeedsPublish ? 'true' : 'false',
+            );
+
+  deploy:
+    name: Deploy Release Image
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_deploy == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/deploy-tag.yml
+    with:
+      ytdlp_version: ${{ needs.check-upstream.outputs.version }}
+      publish_latest: true
+      publish_ghcr: ${{ needs.check-upstream.outputs.publish_ghcr == 'true' }}
+      publish_dockerhub: ${{ needs.check-upstream.outputs.publish_dockerhub == 'true' }}
+    secrets: inherit

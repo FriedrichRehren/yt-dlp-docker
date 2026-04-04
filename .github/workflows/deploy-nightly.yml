@@ -1,0 +1,61 @@
+name: Deploy Nightly Image
+
+on:
+  schedule:
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-nightly
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare Nightly Deploy
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.upstream.outputs.tag }}
+      tags: ${{ steps.tags.outputs.tags }}
+
+    steps:
+      - name: Resolve latest upstream nightly release
+        id: upstream
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const upstream = await github.rest.repos.getLatestRelease({
+              owner: 'yt-dlp',
+              repo: 'yt-dlp-nightly-builds',
+            });
+
+            core.setOutput('tag', upstream.data.tag_name);
+            console.log(
+              `Latest upstream nightly release is ${upstream.data.tag_name}`,
+            );
+
+      - name: Prepare image tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "tags<<EOF"
+            echo "ghcr.io/friedrichrehren/yt-dlp:nightly"
+            echo "friedrichrehren/yt-dlp:nightly"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+  deploy:
+    name: Deploy Nightly Image
+    needs: prepare
+    uses: ./.github/workflows/deploy.yml
+    with:
+      stable: false
+      version: ${{ needs.prepare.outputs.upstream_tag }}
+      tags: ${{ needs.prepare.outputs.tags }}
+    secrets: inherit
