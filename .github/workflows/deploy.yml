@@ -1,52 +1,122 @@
 name: Deploy Image
 
+# Reusable workflow: builds the image, smoke-tests it and pushes it to GHCR
+# and/or Docker Hub. Callers pass plain tag names (e.g. "2026.03.17 latest");
+# the registry prefixes are added here, so image names live in one place.
+
 on:
   workflow_call:
     inputs:
-      stable:
-        description: "Whether this deploy publishes a stable upstream release"
+      ytdlp_version:
+        description: 'yt-dlp release to build (build argument YTDLP_VERSION), or "nightly"'
         required: true
-        type: boolean
+        type: string
       version:
-        description: "Published image version metadata"
+        description: "Version recorded in the image metadata"
         required: true
         type: string
       tags:
-        description: "Newline-delimited image tags to publish"
+        description: "Space- or newline-separated tag names, without registry prefix"
         required: true
         type: string
+      push_ghcr:
+        description: "Push to GHCR"
+        required: false
+        default: true
+        type: boolean
+      push_dockerhub:
+        description: "Push to Docker Hub"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
   packages: write
 
+env:
+  IMAGE_NAME: yt-dlp
+  DOCKERHUB_NAMESPACE: friedrichrehren
+  IMAGE_DESCRIPTION: Ready-to-use Docker image for yt-dlp
+  TEST_IMAGE: yt-dlp:smoke-test
+
 jobs:
-  deploy:
-    name: Build and Push
+  test:
+    name: Build and Smoke Test (amd64)
     runs-on: ubuntu-latest
-    env:
-      BUILD_YTDLP_VERSION: ${{ inputs.stable && inputs.version || 'nightly' }}
-      IMAGE_DESCRIPTION: Ready-to-use Docker image for yt-dlp
-      IMAGE_VERSION: ${{ inputs.version }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Validate non-stable tags
-        if: ${{ !inputs.stable }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          build-args: |
+            YTDLP_VERSION=${{ inputs.ytdlp_version }}
+          tags: ${{ env.TEST_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm "${TEST_IMAGE}" --version
+          docker run --rm --entrypoint ffmpeg "${TEST_IMAGE}" -version >/dev/null
+          docker run --rm --entrypoint deno "${TEST_IMAGE}" --version >/dev/null
+
+  deploy:
+    name: Build and Push
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Resolve image references
+        id: refs
         shell: bash
         env:
           TAGS: ${{ inputs.tags }}
+          YTDLP_VERSION: ${{ inputs.ytdlp_version }}
+          PUSH_GHCR: ${{ inputs.push_ghcr }}
+          PUSH_DOCKERHUB: ${{ inputs.push_dockerhub }}
         run: |
           set -euo pipefail
 
-          if printf '%s\n' "${TAGS}" | grep -Eq ':latest$'; then
-            echo "Non-stable deploys must not publish the latest tag" >&2
+          read -r -a tags <<< "$(tr '\n' ' ' <<< "${TAGS}")"
+          (( ${#tags[@]} > 0 )) || { echo "No tags given" >&2; exit 1; }
+
+          if [[ "${YTDLP_VERSION}" == "nightly" ]] && printf '%s\n' "${tags[@]}" | grep -qx latest; then
+            echo "Nightly builds must not publish the latest tag" >&2
             exit 1
           fi
 
+          [[ "${PUSH_GHCR}" == "true" || "${PUSH_DOCKERHUB}" == "true" ]] \
+            || { echo "No target registry selected" >&2; exit 1; }
+
+          ghcr_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          dockerhub_image="docker.io/${DOCKERHUB_NAMESPACE}/${IMAGE_NAME}"
+
+          {
+            echo "refs<<EOF"
+            for tag in "${tags[@]}"; do
+              if [[ "${PUSH_GHCR}" == "true" ]]; then echo "${ghcr_image}:${tag}"; fi
+              if [[ "${PUSH_DOCKERHUB}" == "true" ]]; then echo "${dockerhub_image}:${tag}"; fi
+            done
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
       - name: Log in to GHCR
+        if: inputs.push_ghcr
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -54,6 +124,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
+        if: inputs.push_dockerhub
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -72,12 +143,13 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           build-args: |
-            YTDLP_VERSION=${{ env.BUILD_YTDLP_VERSION }}
-          tags: ${{ inputs.tags }}
+            YTDLP_VERSION=${{ inputs.ytdlp_version }}
+          tags: ${{ steps.refs.outputs.refs }}
+          cache-from: type=gha
           annotations: |
             index:org.opencontainers.image.description=${{ env.IMAGE_DESCRIPTION }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.description=${{ env.IMAGE_DESCRIPTION }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.IMAGE_VERSION }}
+            org.opencontainers.image.version=${{ inputs.version }}

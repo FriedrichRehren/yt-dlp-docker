@@ -1,0 +1,88 @@
+name: Deploy Manually
+
+# Builds a specific (or the latest) yt-dlp release on demand, e.g. to republish
+# an older version or to push to only one registry.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ytdlp_version:
+        description: 'yt-dlp release tag, or "latest" for the newest upstream release'
+        required: true
+        default: "latest"
+      publish_latest:
+        description: "Also publish the image as latest"
+        required: true
+        default: false
+        type: boolean
+      push_ghcr:
+        description: "Push to GHCR"
+        required: true
+        default: true
+        type: boolean
+      push_dockerhub:
+        description: "Push to Docker Hub"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      tags: ${{ steps.vars.outputs.tags }}
+
+    steps:
+      - name: Resolve version and tags
+        id: vars
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.ytdlp_version }}
+          PUBLISH_LATEST: ${{ inputs.publish_latest }}
+        run: |
+          set -euo pipefail
+
+          case "${INPUT_VERSION}" in
+            nightly)
+              echo "Use deploy-nightly.yml to publish the nightly image" >&2
+              exit 1 ;;
+            latest)
+              version="$(gh release view --repo yt-dlp/yt-dlp --json tagName --jq .tagName)" ;;
+            *)
+              version="${INPUT_VERSION}"
+              gh release view "${version}" --repo yt-dlp/yt-dlp >/dev/null \
+                || { echo "yt-dlp release ${version} does not exist" >&2; exit 1; } ;;
+          esac
+
+          tags="${version}"
+          if [[ "${PUBLISH_LATEST}" == "true" ]]; then tags="${tags} latest"; fi
+
+          echo "Version: ${version}"
+          echo "Tags:    ${tags}"
+          {
+            echo "version=${version}"
+            echo "tags=${tags}"
+          } >> "${GITHUB_OUTPUT}"
+
+  deploy:
+    name: Deploy Image
+    needs: resolve
+    uses: ./.github/workflows/deploy.yml
+    with:
+      ytdlp_version: ${{ needs.resolve.outputs.version }}
+      version: ${{ needs.resolve.outputs.version }}
+      tags: ${{ needs.resolve.outputs.tags }}
+      push_ghcr: ${{ inputs.push_ghcr }}
+      push_dockerhub: ${{ inputs.push_dockerhub }}
+    secrets: inherit

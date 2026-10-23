@@ -1,0 +1,81 @@
+name: Check Upstream Release
+
+# Publishes a new image when yt-dlp released a version that is missing on
+# GHCR or Docker Hub. Only the registry that lacks the version is pushed to.
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and push even if the version is already published"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-release
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: yt-dlp
+  DOCKERHUB_NAMESPACE: friedrichrehren
+
+jobs:
+  check:
+    name: Check Latest Upstream Release
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      push_ghcr: ${{ steps.check.outputs.push_ghcr }}
+      push_dockerhub: ${{ steps.check.outputs.push_dockerhub }}
+
+    steps:
+      - name: Check latest upstream release
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          ghcr_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          dockerhub_image="docker.io/${DOCKERHUB_NAMESPACE}/${IMAGE_NAME}"
+
+          version="$(gh release view --repo yt-dlp/yt-dlp --json tagName --jq .tagName)"
+          echo "Latest upstream release: ${version}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+          missing() { ! docker buildx imagetools inspect "$1" >/dev/null 2>&1; }
+
+          push_ghcr=false
+          push_dockerhub=false
+          if [[ "${FORCE}" == "true" ]] || missing "${ghcr_image}:${version}"; then push_ghcr=true; fi
+          if [[ "${FORCE}" == "true" ]] || missing "${dockerhub_image}:${version}"; then push_dockerhub=true; fi
+
+          echo "Push to GHCR:       ${push_ghcr}"
+          echo "Push to Docker Hub: ${push_dockerhub}"
+          {
+            echo "push_ghcr=${push_ghcr}"
+            echo "push_dockerhub=${push_dockerhub}"
+          } >> "${GITHUB_OUTPUT}"
+
+  deploy:
+    name: Deploy Release Image
+    needs: check
+    if: needs.check.outputs.push_ghcr == 'true' || needs.check.outputs.push_dockerhub == 'true'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      ytdlp_version: ${{ needs.check.outputs.version }}
+      version: ${{ needs.check.outputs.version }}
+      tags: ${{ needs.check.outputs.version }} latest
+      push_ghcr: ${{ needs.check.outputs.push_ghcr == 'true' }}
+      push_dockerhub: ${{ needs.check.outputs.push_dockerhub == 'true' }}
+    secrets: inherit

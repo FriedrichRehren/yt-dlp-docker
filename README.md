@@ -2,9 +2,9 @@
   <h1><code>yt-dlp</code> Docker Image</h1>
   <p>Ready-to-use container image for the upstream <code>yt-dlp</code> CLI with <code>ffmpeg</code>, <code>ffprobe</code>, <code>deno</code>, <code>AtomicParsley</code>, and <code>curl_cffi</code> included.</p>
   <p>
-    <a href="https://github.com/FriedrichRehren/yt-dlp-docker/actions/workflows/check-upstream-tags.yml"><img alt="Check Upstream Release" src="https://github.com/FriedrichRehren/yt-dlp-docker/actions/workflows/check-upstream-tags.yml/badge.svg?branch=main"></a>
-    <a href="https://github.com/FriedrichRehren/yt-dlp-docker/actions/workflows/deploy-tag.yml"><img alt="Deploy Stable Image" src="https://github.com/FriedrichRehren/yt-dlp-docker/actions/workflows/deploy-tag.yml/badge.svg?branch=main"></a>
+    <a href="https://github.com/FriedrichRehren/yt-dlp-docker/actions/workflows/check-upstream.yml"><img alt="Check Upstream Release" src="https://github.com/FriedrichRehren/yt-dlp-docker/actions/workflows/check-upstream.yml/badge.svg?branch=main"></a>
     <a href="https://github.com/FriedrichRehren/yt-dlp-docker/actions/workflows/deploy-nightly.yml"><img alt="Deploy Nightly Image" src="https://github.com/FriedrichRehren/yt-dlp-docker/actions/workflows/deploy-nightly.yml/badge.svg?branch=main"></a>
+    <a href="https://github.com/FriedrichRehren/yt-dlp-docker/actions/workflows/sync-dockerhub-readme.yml"><img alt="Sync Docker Hub README" src="https://github.com/FriedrichRehren/yt-dlp-docker/actions/workflows/sync-dockerhub-readme.yml/badge.svg?branch=main"></a>
   </p>
   <p>
     <a href="https://hub.docker.com/r/friedrichrehren/yt-dlp/tags"><img alt="Current Version" src="https://img.shields.io/docker/v/friedrichrehren/yt-dlp?sort=semver&label=Current%20Version"></a>
@@ -45,12 +45,13 @@ images.
 The repository automation:
 
 1. checks `yt-dlp/yt-dlp` once an hour
-2. compares the latest upstream release to the image version currently carrying
-   the `latest` tag on GHCR
-3. triggers a new container build when upstream has moved
-4. pushes the resulting release image to GHCR and Docker Hub
-5. rebuilds the `nightly` image once per day from the upstream `nightly`
+2. builds a new image when the latest upstream release is missing on GHCR or
+   Docker Hub (only the registry that lacks it is pushed to)
+3. smoke-tests every image (`yt-dlp`, `ffmpeg`, `deno`) before it is pushed
+4. rebuilds the `nightly` image once per day from the upstream `nightly`
    channel and replaces the previous `nightly` tag
+5. keeps its scheduled workflows enabled – GitHub would otherwise disable them
+   after 60 days without commits
 
 The container itself is intentionally simple. Its entrypoint is `yt-dlp`, so the
 image behaves like a containerized `yt-dlp` CLI with the upstream recommended
@@ -246,3 +247,24 @@ The image:
 - uses `/downloads` as the working directory
 
 That means mounted download paths should normally target `/downloads`.
+
+## Repository Setup
+
+### Workflows
+
+| Workflow | Trigger | Purpose |
+| --- | --- | --- |
+| `check-upstream.yml` | hourly, manual | publishes new upstream releases (`<version>` and `latest`) |
+| `deploy-nightly.yml` | daily, manual | rebuilds the `nightly` tag |
+| `deploy-manual.yml` | manual | builds a specific release, optionally as `latest` or for one registry only |
+| `deploy.yml` | called by the workflows above | builds, smoke-tests and pushes the image |
+| `sync-dockerhub-readme.yml` | README change, after releases, manual | copies this README to Docker Hub |
+| `keepalive.yml` | weekly, manual | re-enables all scheduled workflows so GitHub does not disable them |
+
+### Secrets
+
+| Secret | Purpose |
+| --- | --- |
+| `DOCKERHUB_USERNAME` | Docker Hub user |
+| `DOCKERHUB_TOKEN` | Docker Hub access token, scope *Read & Write* (image push) |
+| `DOCKERHUB_README_TOKEN` | optional: token with scope *Read, Write, Delete* – Docker Hub requires it to update the repository description. Falls back to `DOCKERHUB_TOKEN` |
